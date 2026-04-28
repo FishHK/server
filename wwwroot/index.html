@@ -166,6 +166,24 @@
         updateSelection();
     });
 
+    connection.on("GameEnded", players => {
+        document.getElementById('game').classList.add('hidden');
+        document.getElementById('result-screen').classList.remove('hidden');
+
+        let html = "<h3>ラウンド結果</h3>";
+        players.forEach(p => {
+            // 今回のスコア（仮にサーバーから届くとするか、ここで再計算）
+            let roundScore = calculateScore(p.hand);
+            html += `<p><strong>${p.name}</strong>: 今回 ${roundScore}点 / 累計 ${p.totalScore}点</p>`;
+        });
+
+        // 「次のラウンドへ」ボタン（ホストのみ、または全員に表示）
+        html += `<button onclick="start()" style="background:#e67e22; width:100%;">次のラウンドを開始</button>`;
+        html += `<button onclick="location.reload()" style="background:#7f8c8d; width:100%; margin-top:10px;">ルームを解散して終了</button>`;
+
+        document.getElementById('results').innerHTML = html;
+    });
+
     function renderCards(id, cards, clickFn) {
         const div = document.getElementById(id);
         div.innerHTML = '';
