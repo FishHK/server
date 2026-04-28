@@ -80,7 +80,12 @@
 </div>
 
 <script>
-    const connection = new signalR.HubConnectionBuilder().withUrl("/gamehub").build();
+    const connection = new signalR.HubConnectionBuilder()
+        .withUrl("/gamehub", {
+            skipNegotiation: true,
+            transport: signalR.HttpTransportType.WebSockets
+        })
+        .build();
     let selectedHand = null, selectedField = null;
     let gameState = null;
 

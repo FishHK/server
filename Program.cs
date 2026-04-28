@@ -6,7 +6,10 @@ builder.Services.AddSignalR();
 builder.Services.AddCors();
 builder.Services.AddSingleton<GameService>();
 
+builder.Services.AddResponseCompression();
+
 var app = builder.Build();
+app.UseResponseCompression();
 app.UseDefaultFiles();
 app.UseStaticFiles();
 app.UseCors(policy => policy.AllowAnyHeader().AllowAnyMethod().SetIsOriginAllowed(_ => true).AllowCredentials());
