@@ -23,8 +23,9 @@ public class Player
     public string Name { get; set; } = "";
     public List<Card> Hand { get; set; } = new();
     public bool HasActed { get; set; } = false;
-    public int TotalScore { get; set; } = 0; // 累計スコア
-    public int LastRoundScore { get; set; } = 0; // 最新ラウンドのスコア
+    public int TotalScore { get; set; } = 0;
+    public int LastRoundScore { get; set; } = 0;
+    public bool IsCpu { get; set; } = false; // ★追加：CPUフラグ
 }
 
 public class GameSession
@@ -35,7 +36,7 @@ public class GameSession
     public List<Player> Players = new();
     public int CurrentTurnIndex = 0;
     public int? DabutoPlayerIndex = null;
-    public int? RoundStarterIndex = null; // 次の回の親
+    public int? RoundStarterIndex = null;
     public int ConsecutivePasses = 0;
     public bool IsStarted = false;
 
@@ -65,7 +66,6 @@ public class GameSession
         ConsecutivePasses = 0;
     }
 
-    // サーバー側でのスコア計算
     public int CalculateScore(List<Card> hand)
     {
         var ranks = hand.Select(c => c.Rank).Distinct().OrderBy(r => r).ToList();
@@ -111,13 +111,13 @@ public class GameHub : Hub
                 {
                     room.Players.Remove(player);
                     await Groups.RemoveFromGroupAsync(Context.ConnectionId, roomId);
-                    if (room.Players.Count == 0)
-                    {
+                    if (room.Players.Count == 0 || !room.Players.Any(p => !p.IsCpu))
+                    { // 人間がゼロになったら解散
                         _gs.Rooms.TryRemove(roomId, out _);
                     }
                     else if (room.IsStarted)
                     {
-                        await Clients.Group(roomId).SendAsync("RoomAborted", $"{player.Name} が退出したため、ゲームを終了しました。");
+                        await Clients.Group(roomId).SendAsync("RoomAborted", $"{player.Name} が退出したため、ゲームを終了します。");
                         _gs.Rooms.TryRemove(roomId, out _);
                     }
                     else
@@ -148,13 +148,29 @@ public class GameHub : Hub
         await Clients.Group(roomId).SendAsync("UpdatePlayers", room.Players.Select(p => p.Name));
     }
 
+    // ★追加：CPUを部屋に入れる
+    public async Task AddCpu()
+    {
+        if (!_gs.ConnectionToRoom.TryGetValue(Context.ConnectionId, out var roomId)) return;
+        var room = _gs.Rooms[roomId];
+        if (room.IsStarted || room.Players.Count >= 6) return;
+
+        room.Players.Add(new Player
+        {
+            ConnectionId = Guid.NewGuid().ToString(), // ダミーID
+            Name = $"🤖 CPU_{room.Players.Count(p => p.IsCpu) + 1}",
+            IsCpu = true
+        });
+        await Clients.Group(roomId).SendAsync("UpdatePlayers", room.Players.Select(p => p.Name));
+    }
+
     public async Task StartGame()
     {
         if (!_gs.ConnectionToRoom.TryGetValue(Context.ConnectionId, out var roomId)) return;
         var room = _gs.Rooms[roomId];
-        if (room.Players.Count < 1) return;
+        if (room.Players.Count < 2) return; // 1人では始まらない
 
-        room.StartGame(room.RoundStarterIndex == null); // 初回かどうか判定
+        room.StartGame(room.RoundStarterIndex == null);
         await BroadcastState(roomId);
     }
 
@@ -193,15 +209,12 @@ public class GameHub : Hub
             player.HasActed = true;
         }
 
-        // 100点（強制ストップ）のチェック
-        int score = room.CalculateScore(player.Hand);
-        if (score == 100)
+        if (room.CalculateScore(player.Hand) == 100)
         {
-            room.RoundStarterIndex = room.CurrentTurnIndex; // 100点上がりの人が次の親
+            room.RoundStarterIndex = room.CurrentTurnIndex;
             await FinishRound(room);
             return;
         }
-
         await BroadcastState(roomId);
     }
 
@@ -227,7 +240,94 @@ public class GameHub : Hub
 
         if (room.CurrentTurnIndex == room.DabutoPlayerIndex)
         {
-            room.RoundStarterIndex = room.DabutoPlayerIndex; // ダブトした人が次の親
+            room.RoundStarterIndex = room.DabutoPlayerIndex;
+            await FinishRound(room);
+        }
+        else
+        {
+            await BroadcastState(roomId);
+        }
+    }
+
+    // ★追加：CPUの行動を処理する
+    public async Task ExecuteCpuAction()
+    {
+        if (!_gs.ConnectionToRoom.TryGetValue(Context.ConnectionId, out var roomId)) return;
+        var room = _gs.Rooms[roomId];
+        var cpu = room.Players[room.CurrentTurnIndex];
+        if (!cpu.IsCpu || cpu.HasActed) return;
+
+        int score = room.CalculateScore(cpu.Hand);
+
+        if (score >= 60)
+        {
+            // 役が揃っているなら崩さない（パス）
+            room.ConsecutivePasses++;
+            if (room.ConsecutivePasses >= room.Players.Count)
+            {
+                room.Deck.AddRange(room.Field);
+                room.Field = room.Deck.Take(5).ToList();
+                room.Deck.RemoveRange(0, 5);
+                room.ConsecutivePasses = 0;
+            }
+        }
+        else
+        {
+            // 役が揃ってないならランダムに交換
+            int act = Random.Shared.Next(100);
+            if (act < 15)
+            {
+                var temp = room.Field.ToList();
+                room.Field = cpu.Hand.ToList();
+                cpu.Hand = temp;
+                room.ConsecutivePasses = 0;
+            }
+            else
+            {
+                int hIdx = Random.Shared.Next(5);
+                int fIdx = Random.Shared.Next(5);
+                var temp = room.Field[fIdx];
+                room.Field[fIdx] = cpu.Hand[hIdx];
+                cpu.Hand[hIdx] = temp;
+                room.ConsecutivePasses = 0;
+            }
+        }
+        cpu.HasActed = true;
+
+        score = room.CalculateScore(cpu.Hand); // 交換後のスコア再確認
+        if (score == 100)
+        {
+            room.RoundStarterIndex = room.CurrentTurnIndex;
+            await FinishRound(room);
+            return;
+        }
+
+        // ダブト判定
+        if (score >= 60 && room.DabutoPlayerIndex == null)
+        {
+            if (Random.Shared.Next(100) < 50)
+            { // 50%の確率で強気にダブト
+                room.DabutoPlayerIndex = room.CurrentTurnIndex;
+            }
+        }
+
+        await BroadcastState(roomId);
+    }
+
+    // ★追加：CPUのターンを終了させる
+    public async Task ExecuteCpuEndTurn()
+    {
+        if (!_gs.ConnectionToRoom.TryGetValue(Context.ConnectionId, out var roomId)) return;
+        var room = _gs.Rooms[roomId];
+        var cpu = room.Players[room.CurrentTurnIndex];
+        if (!cpu.IsCpu || !cpu.HasActed) return;
+
+        cpu.HasActed = false;
+        room.CurrentTurnIndex = (room.CurrentTurnIndex + 1) % room.Players.Count;
+
+        if (room.CurrentTurnIndex == room.DabutoPlayerIndex)
+        {
+            room.RoundStarterIndex = room.DabutoPlayerIndex;
             await FinishRound(room);
         }
         else
@@ -238,12 +338,10 @@ public class GameHub : Hub
 
     private async Task FinishRound(GameSession room)
     {
-        // スコアの集計とペナルティ判定
         int maxScore = room.Players.Max(p => room.CalculateScore(p.Hand));
         foreach (var p in room.Players)
         {
             int score = room.CalculateScore(p.Hand);
-            // ダブト失敗ペナルティ
             if (room.DabutoPlayerIndex.HasValue && room.Players[room.DabutoPlayerIndex.Value] == p && score < maxScore)
             {
                 score = -score;
@@ -252,7 +350,7 @@ public class GameHub : Hub
             p.TotalScore += score;
         }
 
-        room.IsStarted = false; // 次のラウンド待機へ
+        room.IsStarted = false;
         await Clients.Group(room.RoomId).SendAsync("GameEnded", room.Players.Select(p => new {
             name = p.Name,
             lastScore = p.LastRoundScore,
@@ -263,18 +361,30 @@ public class GameHub : Hub
     private async Task BroadcastState(string roomId)
     {
         if (!_gs.Rooms.TryGetValue(roomId, out var room)) return;
+
+        // 人間プレイヤーの中で一番古い人をホスト（進行役）にする
+        string hostConnectionId = room.Players.FirstOrDefault(p => !p.IsCpu)?.ConnectionId ?? "";
+
         foreach (var p in room.Players)
         {
-            await Clients.Client(p.ConnectionId).SendAsync("ReceiveState", new
+            // CPUの手札は人間には裏面として送る（チート防止）
+            var handToSend = p.IsCpu ? new List<Card>() : p.Hand;
+
+            if (!p.IsCpu)
             {
-                Field = room.Field,
-                Hand = p.Hand,
-                CurrentPlayerName = room.Players[room.CurrentTurnIndex].Name,
-                IsYourTurn = (p.ConnectionId == room.Players[room.CurrentTurnIndex].ConnectionId),
-                HasActed = p.HasActed,
-                DabutoName = room.DabutoPlayerIndex.HasValue ? room.Players[room.DabutoPlayerIndex.Value].Name : null,
-                DeckCount = room.Deck.Count
-            });
+                await Clients.Client(p.ConnectionId).SendAsync("ReceiveState", new
+                {
+                    Field = room.Field,
+                    Hand = p.Hand,
+                    CurrentPlayerName = room.Players[room.CurrentTurnIndex].Name,
+                    IsYourTurn = (p.ConnectionId == room.Players[room.CurrentTurnIndex].ConnectionId),
+                    IsCpuTurn = room.Players[room.CurrentTurnIndex].IsCpu, // CPUのターンか
+                    AmIHost = (p.ConnectionId == hostConnectionId), // 自分はホストか
+                    HasActed = room.Players[room.CurrentTurnIndex].HasActed,
+                    DabutoName = room.DabutoPlayerIndex.HasValue ? room.Players[room.DabutoPlayerIndex.Value].Name : null,
+                    DeckCount = room.Deck.Count
+                });
+            }
         }
     }
 }

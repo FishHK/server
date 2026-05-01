@@ -137,9 +137,9 @@
 
             <div id="waiting-room" class="hidden">
                 <h3 id="current-room-display"></h3>
+                <button onclick="connection.invoke('AddCpu')" style="background:#8e44ad;">🤖 CPUを追加</button>
                 <button id="btn-leave" onclick="leaveRoom()">退出する</button>
             </div>
-
         </div>
 
         <div id="player-list" style="margin:20px; font-size: 18px;"></div>
@@ -267,6 +267,17 @@
 
             document.getElementById('score').innerText = calculateScore(state.hand);
             updateSelection();
+
+            // ★追加：CPUのターンの場合、ホストが自動で処理を進める（ディレイ付き）
+            if (state.isCpuTurn && state.amIHost) {
+                if (!state.hasActed) {
+                    // アクションするまで1.5秒待つ（考えてる風）
+                    setTimeout(() => connection.invoke("ExecuteCpuAction"), 1500);
+                } else {
+                    // アクション終わってから次の人に回すまで1秒待つ
+                    setTimeout(() => connection.invoke("ExecuteCpuEndTurn"), 1000);
+                }
+            }
         });
 
         function renderCards(id, cards, clickFn) {
