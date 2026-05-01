@@ -5,7 +5,6 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSignalR();
 builder.Services.AddCors();
 builder.Services.AddSingleton<GameService>();
-
 builder.Services.AddResponseCompression();
 
 var app = builder.Build();
@@ -17,14 +16,15 @@ app.MapHub<GameHub>("/gamehub");
 app.Run();
 
 public record Card(string Suit, int Rank);
-// --- Playerクラスに累計スコアを追加 ---
+
 public class Player
 {
     public string ConnectionId { get; set; } = "";
     public string Name { get; set; } = "";
     public List<Card> Hand { get; set; } = new();
     public bool HasActed { get; set; } = false;
-    public int TotalScore { get; set; } = 0; // 累計スコア用
+    public int TotalScore { get; set; } = 0; // 累計スコア
+    public int LastRoundScore { get; set; } = 0; // 最新ラウンドのスコア
 }
 
 public class GameSession
@@ -35,7 +35,7 @@ public class GameSession
     public List<Player> Players = new();
     public int CurrentTurnIndex = 0;
     public int? DabutoPlayerIndex = null;
-    public int? RoundStarterIndex = null; // 次の回の開始プレイヤー
+    public int? RoundStarterIndex = null; // 次の回の親
     public int ConsecutivePasses = 0;
     public bool IsStarted = false;
 
@@ -45,7 +45,6 @@ public class GameSession
         Deck = suits.SelectMany(s => Enumerable.Range(1, 13).Select(r => new Card(s, r))).OrderBy(_ => Guid.NewGuid()).ToList();
         Field = Deck.Take(5).ToList(); Deck.RemoveRange(0, 5);
 
-        // 初回はランダム、2回目以降は前回のアタッカーが親
         if (isFirstRound || RoundStarterIndex == null)
         {
             CurrentTurnIndex = Random.Shared.Next(Players.Count);
@@ -65,6 +64,21 @@ public class GameSession
         DabutoPlayerIndex = null;
         ConsecutivePasses = 0;
     }
+
+    // サーバー側でのスコア計算
+    public int CalculateScore(List<Card> hand)
+    {
+        var ranks = hand.Select(c => c.Rank).Distinct().OrderBy(r => r).ToList();
+        if (ranks.Count < 5) return 0;
+        var extended = ranks.Concat(ranks.Select(r => r + 13)).OrderBy(r => r).ToList();
+        bool straight = false;
+        for (int i = 0; i <= extended.Count - 5; i++)
+        {
+            if (extended[i + 4] == extended[i] + 4) { straight = true; break; }
+        }
+        if (!straight) return 0;
+        return hand.GroupBy(c => c.Suit).Max(g => g.Count()) * 20;
+    }
 }
 
 public class GameService
@@ -78,7 +92,6 @@ public class GameHub : Hub
     private readonly GameService _gs;
     public GameHub(GameService gs) => _gs = gs;
 
-    // 通信切断時の自動退出処理
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
         await LeaveRoom();
@@ -87,7 +100,6 @@ public class GameHub : Hub
 
     public Task<bool> CheckRoom(string roomId) => Task.FromResult(_gs.Rooms.ContainsKey(roomId));
 
-    // ルームから退出する処理
     public async Task LeaveRoom()
     {
         if (_gs.ConnectionToRoom.TryGetValue(Context.ConnectionId, out var roomId))
@@ -99,24 +111,18 @@ public class GameHub : Hub
                 {
                     room.Players.Remove(player);
                     await Groups.RemoveFromGroupAsync(Context.ConnectionId, roomId);
-
                     if (room.Players.Count == 0)
                     {
-                        _gs.Rooms.TryRemove(roomId, out _); // 誰もいなくなったら部屋を消滅
+                        _gs.Rooms.TryRemove(roomId, out _);
+                    }
+                    else if (room.IsStarted)
+                    {
+                        await Clients.Group(roomId).SendAsync("RoomAborted", $"{player.Name} が退出したため、ゲームを終了しました。");
+                        _gs.Rooms.TryRemove(roomId, out _);
                     }
                     else
                     {
-                        if (room.IsStarted)
-                        {
-                            // プレイ中に誰かが抜けたら、進行不能になるため強制終了
-                            await Clients.Group(roomId).SendAsync("RoomAborted", $"{player.Name} が退出したため、ゲームを終了しました。");
-                            _gs.Rooms.TryRemove(roomId, out _);
-                        }
-                        else
-                        {
-                            // ロビー待機中なら残りのメンバーリストを更新
-                            await Clients.Group(roomId).SendAsync("UpdatePlayers", room.Players.Select(p => p.Name));
-                        }
+                        await Clients.Group(roomId).SendAsync("UpdatePlayers", room.Players.Select(p => p.Name));
                     }
                 }
             }
@@ -126,8 +132,7 @@ public class GameHub : Hub
 
     public async Task JoinRoom(string name, string roomId, bool create)
     {
-        await LeaveRoom(); // もし既に別の部屋にいたら、まず抜ける（増殖バグ対策）
-
+        await LeaveRoom();
         if (!_gs.Rooms.ContainsKey(roomId))
         {
             if (create) _gs.Rooms[roomId] = new GameSession { RoomId = roomId };
@@ -147,8 +152,9 @@ public class GameHub : Hub
     {
         if (!_gs.ConnectionToRoom.TryGetValue(Context.ConnectionId, out var roomId)) return;
         var room = _gs.Rooms[roomId];
-        // 初回かどうかを判定（RoundStarterIndexが未設定なら初回）
-        room.StartGame(room.RoundStarterIndex == null);
+        if (room.Players.Count < 1) return;
+
+        room.StartGame(room.RoundStarterIndex == null); // 初回かどうか判定
         await BroadcastState(roomId);
     }
 
@@ -186,6 +192,16 @@ public class GameHub : Hub
             }
             player.HasActed = true;
         }
+
+        // 100点（強制ストップ）のチェック
+        int score = room.CalculateScore(player.Hand);
+        if (score == 100)
+        {
+            room.RoundStarterIndex = room.CurrentTurnIndex; // 100点上がりの人が次の親
+            await FinishRound(room);
+            return;
+        }
+
         await BroadcastState(roomId);
     }
 
@@ -204,15 +220,14 @@ public class GameHub : Hub
         if (!_gs.ConnectionToRoom.TryGetValue(Context.ConnectionId, out var roomId)) return;
         var room = _gs.Rooms[roomId];
         var player = room.Players[room.CurrentTurnIndex];
-
-        // 100点ストップのチェックをここで厳密に行う
-        // (PerformAction内で100点になったら即座にここへ誘導するロジックも可)
+        if (player.ConnectionId != Context.ConnectionId || !player.HasActed) return;
 
         player.HasActed = false;
         room.CurrentTurnIndex = (room.CurrentTurnIndex + 1) % room.Players.Count;
 
         if (room.CurrentTurnIndex == room.DabutoPlayerIndex)
         {
+            room.RoundStarterIndex = room.DabutoPlayerIndex; // ダブトした人が次の親
             await FinishRound(room);
         }
         else
@@ -223,14 +238,26 @@ public class GameHub : Hub
 
     private async Task FinishRound(GameSession room)
     {
-        // ダブト宣言者またはストップ者を次回の親に設定
-        // (ストップ実装時はそのプレイヤーのIndexを入れる)
-        room.RoundStarterIndex = room.DabutoPlayerIndex ?? room.CurrentTurnIndex;
+        // スコアの集計とペナルティ判定
+        int maxScore = room.Players.Max(p => room.CalculateScore(p.Hand));
+        foreach (var p in room.Players)
+        {
+            int score = room.CalculateScore(p.Hand);
+            // ダブト失敗ペナルティ
+            if (room.DabutoPlayerIndex.HasValue && room.Players[room.DabutoPlayerIndex.Value] == p && score < maxScore)
+            {
+                score = -score;
+            }
+            p.LastRoundScore = score;
+            p.TotalScore += score;
+        }
 
-        // スコア加算ロジック
-        // ※前回のスコア計算ロジックをサーバー側に集約して呼び出す
-        await Clients.Group(room.RoomId).SendAsync("GameEnded", room.Players);
-        room.IsStarted = false; // 次のラウンド開始待ち状態へ
+        room.IsStarted = false; // 次のラウンド待機へ
+        await Clients.Group(room.RoomId).SendAsync("GameEnded", room.Players.Select(p => new {
+            name = p.Name,
+            lastScore = p.LastRoundScore,
+            totalScore = p.TotalScore
+        }));
     }
 
     private async Task BroadcastState(string roomId)
